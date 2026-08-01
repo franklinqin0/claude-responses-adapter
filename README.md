@@ -40,6 +40,7 @@ chmod +x install.sh
 - 将适配器安装到 `~/.claude/responses-adapter.mjs`
 - 合并 `~/.claude/settings.json`，保留已有的其他配置
 - 修改现有配置前生成带时间戳的备份
+- 重新安装时安全复用已有本地适配器凭据，不显示 API Key
 - macOS：创建并启动 LaunchAgent
 - Linux：创建并启用 `systemd --user` 服务
 - 将敏感配置文件权限设置为 `0600`
@@ -55,6 +56,13 @@ chmod +x install.sh
 
 ```bash
 ./install.sh --model gpt-5.6-terra --upstream https://ca.memofun.net --port 47827
+```
+
+Linux 服务模式默认为 `auto`：优先使用 `systemd --user`，不可用时自动退回无需 root 的 `nohup` 进程。也可明确选择：
+
+```bash
+./install.sh --service-mode systemd
+./install.sh --service-mode nohup
 ```
 
 也可以使用环境变量，避免把 Key 写入 shell 历史：
@@ -87,23 +95,35 @@ tail -50 ~/.claude/logs/responses-adapter.error.log
 
 ### Linux 服务管理
 
+使用 systemd 时：
+
 ```bash
 systemctl --user status net.memofun.claude-responses-adapter.service --no-pager
 journalctl --user -u net.memofun.claude-responses-adapter.service -n 50 --no-pager
 ```
 
-部分无桌面的 Linux 服务器没有持久用户会话。如果安装器提示无法连接用户级 systemd，执行一次：
+使用自动 `nohup` 回退时：
+
+```bash
+ps -p "$(cat ~/.claude/responses-adapter.pid)" -o pid,etime,command
+tail -50 ~/.claude/logs/responses-adapter.error.log
+```
+
+`nohup` 不需要 sudo，但受服务器策略影响，可能在退出 SSH 或重启后停止。重新运行 `./install.sh --service-mode nohup` 即可启动。
+
+部分无桌面的 Linux 服务器没有持久用户会话。只有管理员有权开启 linger：
 
 ```bash
 sudo loginctl enable-linger "$USER"
 ```
 
-然后重新登录，或重新执行：
+如果你没有 sudo 权限，不要切换到 root；直接使用默认 `auto` 或明确使用 `nohup`：
 
 ```bash
-systemctl --user daemon-reload
-./install.sh
+./install.sh --service-mode nohup
 ```
+
+若服务器在登出时强制终止所有用户进程，则需要管理员开启 linger，或使用该集群批准的任务守护方式（例如 Slurm、Supervisor、tmux）。
 
 更新代码后重新安装：
 
@@ -111,6 +131,8 @@ systemctl --user daemon-reload
 git pull
 ./install.sh
 ```
+
+如果现有 `settings.json` 已指向本地适配器，更新安装时会自动复用已有凭据，不需要再次输入 Key。
 
 ## 安全说明
 

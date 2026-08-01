@@ -6,6 +6,8 @@ UPSTREAM_BASE_URL="${RESPONSES_UPSTREAM_BASE_URL:-https://ca.memofun.net}"
 MODEL="${RESPONSES_DEFAULT_MODEL:-gpt-5.6-sol}"
 PORT="${CLAUDE_RESPONSES_ADAPTER_PORT:-47827}"
 API_KEY="${MEMOFUN_API_KEY:-}"
+SERVICE_MODE="${RESPONSES_SERVICE_MODE:-auto}"
+ACTIVE_SERVICE_MODE=""
 
 usage() {
   cat <<'EOF'
@@ -16,11 +18,13 @@ Options:
   --model MODEL       Responses model (default: gpt-5.6-sol)
   --upstream URL      Upstream base URL (default: https://ca.memofun.net)
   --port PORT         Local adapter port (default: 47827)
+  --service-mode MODE Linux service: auto, systemd, or nohup (default: auto)
   -h, --help          Show this help
 
 Environment alternatives:
   MEMOFUN_API_KEY, RESPONSES_DEFAULT_MODEL,
-  RESPONSES_UPSTREAM_BASE_URL, CLAUDE_RESPONSES_ADAPTER_PORT
+  RESPONSES_UPSTREAM_BASE_URL, CLAUDE_RESPONSES_ADAPTER_PORT,
+  RESPONSES_SERVICE_MODE
 EOF
 }
 
@@ -40,6 +44,10 @@ while (($#)); do
       ;;
     --port)
       PORT="${2:-}"
+      shift 2
+      ;;
+    --service-mode)
+      SERVICE_MODE="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -62,6 +70,17 @@ case "$PLATFORM" in
     exit 1
     ;;
 esac
+case "$SERVICE_MODE" in
+  auto|systemd|nohup) ;;
+  *)
+    echo "Service mode must be one of: auto, systemd, nohup." >&2
+    exit 1
+    ;;
+esac
+if [[ "$PLATFORM" == "Darwin" && "$SERVICE_MODE" != "auto" ]]; then
+  echo "--service-mode is only used on Linux; omit it on macOS." >&2
+  exit 1
+fi
 
 NODE_BIN="$(command -v node || true)"
 if [[ -z "$NODE_BIN" ]]; then
@@ -76,6 +95,27 @@ NODE_MAJOR="$($NODE_BIN -p 'Number(process.versions.node.split(".")[0])')"
 if ((NODE_MAJOR < 20)); then
   echo "Node.js 20+ is required; found $($NODE_BIN --version)." >&2
   exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ADAPTER_PATH="$CONFIG_DIR/responses-adapter.mjs"
+SETTINGS_PATH="$CONFIG_DIR/settings.json"
+LOG_DIR="$CONFIG_DIR/logs"
+
+if [[ -z "$API_KEY" && -f "$SETTINGS_PATH" ]]; then
+  API_KEY="$(CLAUDE_SETTINGS_PATH="$SETTINGS_PATH" "$NODE_BIN" -e '
+const fs = require("node:fs");
+try {
+  const settings = JSON.parse(fs.readFileSync(process.env.CLAUDE_SETTINGS_PATH, "utf8"));
+  const baseUrl = settings?.env?.ANTHROPIC_BASE_URL || "";
+  const token = settings?.env?.ANTHROPIC_AUTH_TOKEN || "";
+  if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(baseUrl) && token) process.stdout.write(token);
+} catch {}
+')"
+  if [[ -n "$API_KEY" ]]; then
+    echo "Reusing the existing local-adapter credential from $SETTINGS_PATH."
+  fi
 fi
 
 if [[ -z "$API_KEY" ]]; then
@@ -104,12 +144,6 @@ if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1024 || PORT > 65535)); then
   echo "Port must be an integer between 1024 and 65535." >&2
   exit 1
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-ADAPTER_PATH="$CONFIG_DIR/responses-adapter.mjs"
-SETTINGS_PATH="$CONFIG_DIR/settings.json"
-LOG_DIR="$CONFIG_DIR/logs"
 
 mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 install -m 700 "$SCRIPT_DIR/responses-adapter.mjs" "$ADAPTER_PATH"
@@ -252,14 +286,13 @@ fs.chmodSync(process.env.PLIST_PATH_VALUE, 0o600);
   launchctl kickstart -k "$domain/$LABEL"
 }
 
-install_linux_service() {
+install_linux_systemd_service() {
   local systemd_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   local service_name="$LABEL.service"
   local service_path="$systemd_config_dir/$service_name"
 
   if ! command -v systemctl >/dev/null 2>&1; then
-    echo "systemd is required for automatic startup on Linux (systemctl was not found)." >&2
-    exit 1
+    return 1
   fi
 
   mkdir -p "$systemd_config_dir"
@@ -297,19 +330,91 @@ fs.chmodSync(process.env.SERVICE_PATH_VALUE, 0o600);
 '
 
   chmod 600 "$service_path"
-  if ! systemctl --user daemon-reload; then
-    echo "Unable to connect to the per-user systemd manager." >&2
-    echo "On a headless server, enable a user session/lingering, then rerun:" >&2
-    echo "  sudo loginctl enable-linger $USER" >&2
-    exit 1
+  systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+  systemctl --user enable "$service_name" >/dev/null 2>&1 || return 1
+  systemctl --user restart "$service_name" >/dev/null 2>&1 || return 1
+  ACTIVE_SERVICE_MODE="systemd"
+}
+
+start_linux_nohup_service() {
+  local pid_path="$CONFIG_DIR/responses-adapter.pid"
+  local stdout_path="$LOG_DIR/responses-adapter.log"
+  local stderr_path="$LOG_DIR/responses-adapter.error.log"
+  local old_pid=""
+  local old_command=""
+  local adapter_pid=""
+
+  # Avoid a future port conflict if a user systemd service was previously active.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now "$LABEL.service" >/dev/null 2>&1 || true
   fi
-  systemctl --user enable "$service_name" >/dev/null
-  if ! systemctl --user restart "$service_name"; then
-    echo "Failed to start $service_name. Inspect it with:" >&2
-    echo "  systemctl --user status $service_name --no-pager" >&2
-    echo "  journalctl --user -u $service_name -n 50 --no-pager" >&2
-    exit 1
+
+  if [[ -f "$pid_path" ]]; then
+    IFS= read -r old_pid < "$pid_path" || true
   fi
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+    if [[ -r "/proc/$old_pid/cmdline" ]]; then
+      old_command="$(tr '\0' ' ' < "/proc/$old_pid/cmdline")"
+    else
+      old_command="$(ps -p "$old_pid" -o command= 2>/dev/null || true)"
+    fi
+    if [[ "$old_command" == *"$ADAPTER_PATH"* ]]; then
+      kill "$old_pid"
+      for _ in {1..20}; do
+        if ! kill -0 "$old_pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+      if kill -0 "$old_pid" 2>/dev/null; then
+        echo "Existing adapter process $old_pid did not stop; refusing to start a duplicate." >&2
+        return 1
+      fi
+    fi
+  fi
+
+  nohup env \
+    CLAUDE_RESPONSES_ADAPTER_HOST=127.0.0.1 \
+    CLAUDE_RESPONSES_ADAPTER_PORT="$PORT" \
+    RESPONSES_UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL%/}" \
+    RESPONSES_DEFAULT_MODEL="$MODEL" \
+    "$NODE_BIN" "$ADAPTER_PATH" \
+    >>"$stdout_path" 2>>"$stderr_path" </dev/null &
+  adapter_pid=$!
+  printf '%s\n' "$adapter_pid" > "$pid_path"
+  chmod 600 "$pid_path"
+  sleep 0.5
+  if ! kill -0 "$adapter_pid" 2>/dev/null; then
+    echo "The unprivileged adapter process exited during startup." >&2
+    tail -30 "$stderr_path" >&2 2>/dev/null || true
+    return 1
+  fi
+  ACTIVE_SERVICE_MODE="nohup"
+}
+
+install_linux_service() {
+  case "$SERVICE_MODE" in
+    systemd)
+      if ! install_linux_systemd_service; then
+        echo "Unable to start the per-user systemd service." >&2
+        echo "If an administrator permits lingering, they can run:" >&2
+        echo "  sudo loginctl enable-linger $USER" >&2
+        echo "Otherwise rerun without root using:" >&2
+        echo "  ./install.sh --service-mode nohup" >&2
+        exit 1
+      fi
+      ;;
+    nohup)
+      start_linux_nohup_service
+      ;;
+    auto)
+      if ! install_linux_systemd_service; then
+        echo "User systemd is unavailable; falling back to an unprivileged nohup process." >&2
+        echo "This works without sudo, but the process may not survive logout or reboot." >&2
+        start_linux_nohup_service
+      fi
+      ;;
+  esac
 }
 
 chmod 600 "$SETTINGS_PATH"
@@ -333,7 +438,7 @@ done
 
 if ((healthy == 0)); then
   echo "Adapter failed its health check." >&2
-  if [[ "$PLATFORM" == "Darwin" ]]; then
+  if [[ "$PLATFORM" == "Darwin" || "$ACTIVE_SERVICE_MODE" == "nohup" ]]; then
     echo "Error log:" >&2
     tail -30 "$LOG_DIR/responses-adapter.error.log" >&2 2>/dev/null || true
   else
@@ -351,6 +456,11 @@ echo "Model:   $MODEL"
 echo "Test:    claude -p --max-turns 1 \"Reply with exactly OK.\""
 if [[ "$PLATFORM" == "Darwin" ]]; then
   echo "Status:  launchctl print \"gui/$(id -u)/$LABEL\""
-else
+elif [[ "$ACTIVE_SERVICE_MODE" == "systemd" ]]; then
+  echo "Service: systemd --user"
   echo "Status:  systemctl --user status $LABEL.service --no-pager"
+else
+  echo "Service: nohup fallback (no root required; may stop at logout/reboot)"
+  echo "Status:  ps -p \"\$(cat $CONFIG_DIR/responses-adapter.pid)\" -o pid,etime,command"
+  echo "Logs:    tail -50 $LOG_DIR/responses-adapter.error.log"
 fi
