@@ -54,14 +54,27 @@ while (($#)); do
   esac
 done
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "This installer currently supports macOS only." >&2
-  exit 1
-fi
+PLATFORM="${RESPONSES_INSTALL_PLATFORM:-$(uname -s)}"
+case "$PLATFORM" in
+  Darwin|Linux) ;;
+  *)
+    echo "Unsupported operating system: $PLATFORM (supported: macOS and Linux)." >&2
+    exit 1
+    ;;
+esac
 
 NODE_BIN="$(command -v node || true)"
 if [[ -z "$NODE_BIN" ]]; then
-  echo "Node.js is required. Install it first, for example: brew install node" >&2
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    echo "Node.js 20+ is required. Install it first, for example: brew install node" >&2
+  else
+    echo "Node.js 20+ is required. Install it with your distribution package manager or NodeSource." >&2
+  fi
+  exit 1
+fi
+NODE_MAJOR="$($NODE_BIN -p 'Number(process.versions.node.split(".")[0])')"
+if ((NODE_MAJOR < 20)); then
+  echo "Node.js 20+ is required; found $($NODE_BIN --version)." >&2
   exit 1
 fi
 
@@ -83,6 +96,10 @@ if [[ ! "$UPSTREAM_BASE_URL" =~ ^https:// ]]; then
   echo "Upstream URL must start with https://" >&2
   exit 1
 fi
+if [[ "$UPSTREAM_BASE_URL" == *$'\n'* || "$MODEL" == *$'\n'* ]]; then
+  echo "Upstream URL and model must not contain newlines." >&2
+  exit 1
+fi
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || ((PORT < 1024 || PORT > 65535)); then
   echo "Port must be an integer between 1024 and 65535." >&2
   exit 1
@@ -93,10 +110,8 @@ CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 ADAPTER_PATH="$CONFIG_DIR/responses-adapter.mjs"
 SETTINGS_PATH="$CONFIG_DIR/settings.json"
 LOG_DIR="$CONFIG_DIR/logs"
-LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 
-mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$LAUNCH_AGENTS_DIR"
+mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 install -m 700 "$SCRIPT_DIR/responses-adapter.mjs" "$ADAPTER_PATH"
 
 CLAUDE_SETTINGS_PATH="$SETTINGS_PATH" \
@@ -146,15 +161,22 @@ fs.writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 }
 fs.chmodSync(path, 0o600);
 '
 
-PLIST_PATH_VALUE="$PLIST_PATH" \
-NODE_BIN_VALUE="$NODE_BIN" \
-ADAPTER_PATH_VALUE="$ADAPTER_PATH" \
-LOG_DIR_VALUE="$LOG_DIR" \
-UPSTREAM_VALUE="${UPSTREAM_BASE_URL%/}" \
-MODEL_VALUE="$MODEL" \
-PORT_VALUE="$PORT" \
-LABEL_VALUE="$LABEL" \
-"$NODE_BIN" -e '
+install_macos_service() {
+  local launch_agents_dir="$HOME/Library/LaunchAgents"
+  local plist_path="$launch_agents_dir/$LABEL.plist"
+  local domain="gui/$(id -u)"
+  local bootstrapped=0
+
+  mkdir -p "$launch_agents_dir"
+  PLIST_PATH_VALUE="$plist_path" \
+  NODE_BIN_VALUE="$NODE_BIN" \
+  ADAPTER_PATH_VALUE="$ADAPTER_PATH" \
+  LOG_DIR_VALUE="$LOG_DIR" \
+  UPSTREAM_VALUE="${UPSTREAM_BASE_URL%/}" \
+  MODEL_VALUE="$MODEL" \
+  PORT_VALUE="$PORT" \
+  LABEL_VALUE="$LABEL" \
+  "$NODE_BIN" -e '
 const fs = require("node:fs");
 const escapeXml = (value) => String(value)
   .replaceAll("&", "&amp;")
@@ -204,33 +226,100 @@ fs.writeFileSync(process.env.PLIST_PATH_VALUE, plist, { mode: 0o600 });
 fs.chmodSync(process.env.PLIST_PATH_VALUE, 0o600);
 '
 
-chmod 600 "$SETTINGS_PATH" "$PLIST_PATH"
-node --check "$ADAPTER_PATH"
-plutil -lint "$PLIST_PATH" >/dev/null
+  chmod 600 "$plist_path"
+  plutil -lint "$plist_path" >/dev/null
 
-DOMAIN="gui/$(id -u)"
-if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-  launchctl bootout "$DOMAIN/$LABEL"
-  for _ in {1..20}; do
-    if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  if launchctl print "$domain/$LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$domain/$LABEL"
+    for _ in {1..20}; do
+      if ! launchctl print "$domain/$LABEL" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+
+  for _ in {1..10}; do
+    if launchctl bootstrap "$domain" "$plist_path" 2>/dev/null; then
+      bootstrapped=1
       break
     fi
-    sleep 0.1
+    sleep 0.25
   done
-fi
-
-bootstrapped=0
-for _ in {1..10}; do
-  if launchctl bootstrap "$DOMAIN" "$PLIST_PATH" 2>/dev/null; then
-    bootstrapped=1
-    break
+  if ((bootstrapped == 0)); then
+    launchctl bootstrap "$domain" "$plist_path"
   fi
-  sleep 0.25
-done
-if ((bootstrapped == 0)); then
-  launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
+  launchctl kickstart -k "$domain/$LABEL"
+}
+
+install_linux_service() {
+  local systemd_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  local service_name="$LABEL.service"
+  local service_path="$systemd_config_dir/$service_name"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemd is required for automatic startup on Linux (systemctl was not found)." >&2
+    exit 1
+  fi
+
+  mkdir -p "$systemd_config_dir"
+  SERVICE_PATH_VALUE="$service_path" \
+  NODE_BIN_VALUE="$NODE_BIN" \
+  ADAPTER_PATH_VALUE="$ADAPTER_PATH" \
+  UPSTREAM_VALUE="${UPSTREAM_BASE_URL%/}" \
+  MODEL_VALUE="$MODEL" \
+  PORT_VALUE="$PORT" \
+  "$NODE_BIN" -e '
+const fs = require("node:fs");
+const quote = (value) => `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
+const env = (name, value) => `Environment=${quote(`${name}=${value}`)}`;
+const unit = `[Unit]
+Description=Claude Code Responses API adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${quote(process.env.NODE_BIN_VALUE)} ${quote(process.env.ADAPTER_PATH_VALUE)}
+${env("CLAUDE_RESPONSES_ADAPTER_HOST", "127.0.0.1")}
+${env("CLAUDE_RESPONSES_ADAPTER_PORT", process.env.PORT_VALUE)}
+${env("RESPONSES_UPSTREAM_BASE_URL", process.env.UPSTREAM_VALUE)}
+${env("RESPONSES_DEFAULT_MODEL", process.env.MODEL_VALUE)}
+Restart=always
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target
+`;
+fs.writeFileSync(process.env.SERVICE_PATH_VALUE, unit, { mode: 0o600 });
+fs.chmodSync(process.env.SERVICE_PATH_VALUE, 0o600);
+'
+
+  chmod 600 "$service_path"
+  if ! systemctl --user daemon-reload; then
+    echo "Unable to connect to the per-user systemd manager." >&2
+    echo "On a headless server, enable a user session/lingering, then rerun:" >&2
+    echo "  sudo loginctl enable-linger $USER" >&2
+    exit 1
+  fi
+  systemctl --user enable "$service_name" >/dev/null
+  if ! systemctl --user restart "$service_name"; then
+    echo "Failed to start $service_name. Inspect it with:" >&2
+    echo "  systemctl --user status $service_name --no-pager" >&2
+    echo "  journalctl --user -u $service_name -n 50 --no-pager" >&2
+    exit 1
+  fi
+}
+
+chmod 600 "$SETTINGS_PATH"
+node --check "$ADAPTER_PATH"
+
+if [[ "$PLATFORM" == "Darwin" ]]; then
+  install_macos_service
+else
+  install_linux_service
 fi
-launchctl kickstart -k "$DOMAIN/$LABEL"
 
 HEALTH_URL="http://127.0.0.1:$PORT/health"
 healthy=0
@@ -243,13 +332,25 @@ for _ in {1..20}; do
 done
 
 if ((healthy == 0)); then
-  echo "Adapter failed its health check. Error log:" >&2
-  tail -30 "$LOG_DIR/responses-adapter.error.log" >&2 2>/dev/null || true
+  echo "Adapter failed its health check." >&2
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    echo "Error log:" >&2
+    tail -30 "$LOG_DIR/responses-adapter.error.log" >&2 2>/dev/null || true
+  else
+    echo "Service log:" >&2
+    journalctl --user -u "$LABEL.service" -n 30 --no-pager >&2 2>/dev/null || true
+  fi
   exit 1
 fi
 
 unset API_KEY ADAPTER_API_KEY MEMOFUN_API_KEY
 echo "Installed successfully."
+echo "Platform: $PLATFORM"
 echo "Adapter: $HEALTH_URL"
 echo "Model:   $MODEL"
 echo "Test:    claude -p --max-turns 1 \"Reply with exactly OK.\""
+if [[ "$PLATFORM" == "Darwin" ]]; then
+  echo "Status:  launchctl print \"gui/$(id -u)/$LABEL\""
+else
+  echo "Status:  systemctl --user status $LABEL.service --no-pager"
+fi
