@@ -29,18 +29,31 @@ async function proxyFetch(url, options = {}) {
       const req = https.request(
         { host: parsed.hostname, port: parsed.port || 443, path: parsed.pathname + parsed.search, method: options.method || "GET", headers: options.headers || {}, agent },
         (res) => {
-          const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => {
-            const body = Buffer.concat(chunks);
-            resolve({
-              ok: res.statusCode >= 200 && res.statusCode < 300,
-              status: res.statusCode,
-              headers: { get: (n) => res.headers[n.toLowerCase()] || null },
-              json: () => JSON.parse(body.toString("utf8")),
-              text: () => body.toString("utf8"),
-              body: res,
-            });
+          // Do NOT attach a "data" listener here — that would put the stream
+          // into flowing mode and consume all chunks, breaking streaming.
+          // Instead, pause the stream so the caller can iterate with
+          // for-await-of or pipe it elsewhere.
+          res.pause();
+          // Buffer the body lazily only when .text() or .json() is called.
+          let bodyPromise = null;
+          const ensureBody = () => {
+            if (!bodyPromise) {
+              bodyPromise = new Promise((bodyResolve) => {
+                const chunks = [];
+                res.on("data", (c) => chunks.push(c));
+                res.on("end", () => bodyResolve(Buffer.concat(chunks)));
+                res.resume();
+              });
+            }
+            return bodyPromise;
+          };
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            headers: { get: (n) => res.headers[n.toLowerCase()] || null },
+            json: () => ensureBody().then((b) => JSON.parse(b.toString("utf8"))),
+            text: () => ensureBody().then((b) => b.toString("utf8")),
+            body: res,
           });
         },
       );
@@ -514,6 +527,7 @@ async function handleMessages(req, res) {
         authorization,
         "content-type": "application/json",
         "user-agent": `claude-responses-adapter/${VERSION}`,
+        "idempotency-key": `claude-responses-adapter-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       },
       body: JSON.stringify(responsesBody),
       signal: controller.signal,
