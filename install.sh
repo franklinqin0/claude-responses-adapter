@@ -101,10 +101,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 ADAPTER_PATH="$CONFIG_DIR/responses-adapter.mjs"
 SETTINGS_PATH="$CONFIG_DIR/settings.json"
+BACKUP_SETTINGS_PATH="$CONFIG_DIR/settings_az.json"
 LOG_DIR="$CONFIG_DIR/logs"
 
-if [[ -z "$API_KEY" && -f "$SETTINGS_PATH" ]]; then
-  API_KEY="$(CLAUDE_SETTINGS_PATH="$SETTINGS_PATH" "$NODE_BIN" -e '
+# Try to reuse credentials from the main settings.json, settings_mt.json, or settings_az.json.
+if [[ -z "$API_KEY" ]]; then
+  for _candidate in "$SETTINGS_PATH" "$CONFIG_DIR/settings_mt.json" "$BACKUP_SETTINGS_PATH"; do
+    if [[ -f "$_candidate" ]]; then
+      API_KEY="$(CLAUDE_SETTINGS_PATH="$_candidate" "$NODE_BIN" -e '
 const fs = require("node:fs");
 try {
   const settings = JSON.parse(fs.readFileSync(process.env.CLAUDE_SETTINGS_PATH, "utf8"));
@@ -113,9 +117,12 @@ try {
   if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(baseUrl) && token) process.stdout.write(token);
 } catch {}
 ')"
-  if [[ -n "$API_KEY" ]]; then
-    echo "Reusing the existing local-adapter credential from $SETTINGS_PATH."
-  fi
+      if [[ -n "$API_KEY" ]]; then
+        echo "Reusing the existing local-adapter credential from $_candidate."
+        break
+      fi
+    fi
+  done
 fi
 
 if [[ -z "$API_KEY" ]]; then
@@ -149,24 +156,27 @@ mkdir -p "$CONFIG_DIR" "$LOG_DIR"
 install -m 700 "$SCRIPT_DIR/responses-adapter.mjs" "$ADAPTER_PATH"
 
 CLAUDE_SETTINGS_PATH="$SETTINGS_PATH" \
+BACKUP_SETTINGS_PATH="$BACKUP_SETTINGS_PATH" \
 ADAPTER_API_KEY="$API_KEY" \
 ADAPTER_MODEL="$MODEL" \
 ADAPTER_PORT="$PORT" \
 "$NODE_BIN" -e '
 const fs = require("node:fs");
-const path = process.env.CLAUDE_SETTINGS_PATH;
+const mainPath = process.env.CLAUDE_SETTINGS_PATH;
+const backupPath = process.env.BACKUP_SETTINGS_PATH;
+
+// Start from a copy of the main settings.json (if it exists) so that
+// permissions, sandbox, and other user preferences are preserved.
 let settings = {};
-if (fs.existsSync(path)) {
-  const source = fs.readFileSync(path, "utf8");
+if (fs.existsSync(mainPath)) {
   try {
-    settings = JSON.parse(source);
+    settings = JSON.parse(fs.readFileSync(mainPath, "utf8"));
   } catch (error) {
     console.error(`Existing settings file is invalid JSON: ${error.message}`);
     process.exit(1);
   }
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  fs.copyFileSync(path, `${path}.backup-${stamp}`);
 }
+
 settings.env = {
   ...(settings.env || {}),
   ANTHROPIC_BASE_URL: `http://127.0.0.1:${process.env.ADAPTER_PORT}`,
@@ -191,8 +201,10 @@ for (const key of [
 ]) delete settings.env[key];
 settings.effortLevel = "max";
 settings.model = process.env.ADAPTER_MODEL;
-fs.writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-fs.chmodSync(path, 0o600);
+
+// Write to the backup file instead of overwriting the main settings.json
+fs.writeFileSync(backupPath, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+fs.chmodSync(backupPath, 0o600);
 '
 
 install_macos_service() {
@@ -417,7 +429,6 @@ install_linux_service() {
   esac
 }
 
-chmod 600 "$SETTINGS_PATH"
 node --check "$ADAPTER_PATH"
 
 if [[ "$PLATFORM" == "Darwin" ]]; then
@@ -453,6 +464,14 @@ echo "Installed successfully."
 echo "Platform: $PLATFORM"
 echo "Adapter: $HEALTH_URL"
 echo "Model:   $MODEL"
+echo ""
+echo "Settings written to: $BACKUP_SETTINGS_PATH"
+echo "Your active settings.json was NOT modified."
+echo ""
+echo "Switch between configurations:"
+echo "  cp ~/.claude/settings_mt.json ~/.claude/settings.json   # Meituan (sankuai)"
+echo "  cp ~/.claude/settings_az.json ~/.claude/settings.json   # Responses adapter"
+echo ""
 echo "Test:    claude -p --max-turns 1 \"Reply with exactly OK.\""
 if [[ "$PLATFORM" == "Darwin" ]]; then
   echo "Status:  launchctl print \"gui/$(id -u)/$LABEL\""

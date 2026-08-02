@@ -38,8 +38,8 @@ chmod +x install.sh
 安装器会隐藏输入 API Key，并执行以下操作：
 
 - 将适配器安装到 `~/.claude/responses-adapter.mjs`
-- 合并 `~/.claude/settings.json`，保留已有的其他配置
-- 修改现有配置前生成带时间戳的备份
+- 将适配器配置写入 `~/.claude/settings_az.json`（备用文件），**不修改**正在使用的 `~/.claude/settings.json`
+- 基于现有 `settings.json` 生成备用配置，保留已有的其他配置项
 - 重新安装时安全复用已有本地适配器凭据，不显示 API Key
 - macOS：创建并启动 LaunchAgent
 - Linux：创建并启用 `systemd --user` 服务
@@ -132,7 +132,14 @@ git pull
 ./install.sh
 ```
 
-如果现有 `settings.json` 已指向本地适配器，更新安装时会自动复用已有凭据，不需要再次输入 Key。
+如果现有 `settings.json`、`settings_mt.json` 或 `settings_az.json` 已指向本地适配器，更新安装时会自动复用已有凭据，不需要再次输入 Key。
+
+安装完成后，备用配置位于 `~/.claude/settings_az.json`，原始配置可保存为 `~/.claude/settings_mt.json`。切换方式：
+
+```bash
+cp ~/.claude/settings_mt.json ~/.claude/settings.json   # 切回原始配置
+cp ~/.claude/settings_az.json ~/.claude/settings.json   # 切到 Responses 适配器
+```
 
 ## 安全说明
 
