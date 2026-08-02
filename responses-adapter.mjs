@@ -1,8 +1,62 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import https from "node:https";
+import { URL } from "node:url";
 import process from "node:process";
 import { once } from "node:events";
+
+// Proxy support: Node.js built-in fetch (undici) does not respect
+// http_proxy/https_proxy env vars. When a proxy is configured, we
+// build a proxied fetch using the standard HTTP CONNECT tunnel so
+// no external packages are needed.
+const PROXY_URL =
+  process.env.https_proxy || process.env.HTTPS_PROXY ||
+  process.env.http_proxy || process.env.HTTP_PROXY || "";
+
+async function proxyFetch(url, options = {}) {
+  const parsed = new URL(url);
+  const proxy = new URL(PROXY_URL);
+  return new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxy.hostname,
+      port: proxy.port,
+      method: "CONNECT",
+      path: `${parsed.hostname}:${parsed.port || 443}`,
+    });
+    connectReq.on("connect", (_res, socket) => {
+      const agent = new https.Agent({ socket, rejectUnauthorized: true });
+      const req = https.request(
+        { host: parsed.hostname, port: parsed.port || 443, path: parsed.pathname + parsed.search, method: options.method || "GET", headers: options.headers || {}, agent },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const body = Buffer.concat(chunks);
+            resolve({
+              ok: res.statusCode >= 200 && res.statusCode < 300,
+              status: res.statusCode,
+              headers: { get: (n) => res.headers[n.toLowerCase()] || null },
+              json: () => JSON.parse(body.toString("utf8")),
+              text: () => body.toString("utf8"),
+              body: res,
+            });
+          });
+        },
+      );
+      req.on("error", reject);
+      if (options.body) req.write(options.body);
+      req.end();
+    });
+    connectReq.on("error", reject);
+    if (options.signal) {
+      options.signal.addEventListener("abort", () => { connectReq.destroy(); reject(new Error("Aborted")); }, { once: true });
+    }
+    connectReq.end();
+  });
+}
+
+const upstreamFetch = PROXY_URL ? proxyFetch : fetch;
 
 const HOST = process.env.CLAUDE_RESPONSES_ADAPTER_HOST || "127.0.0.1";
 const PORT = Number(process.env.CLAUDE_RESPONSES_ADAPTER_PORT || 47827);
@@ -454,7 +508,7 @@ async function handleMessages(req, res) {
 
   let upstream;
   try {
-    upstream = await fetch(`${UPSTREAM_BASE_URL}/v1/responses`, {
+    upstream = await upstreamFetch(`${UPSTREAM_BASE_URL}/v1/responses`, {
       method: "POST",
       headers: {
         authorization,
@@ -521,7 +575,8 @@ server.headersTimeout = 75_000;
 server.requestTimeout = 0;
 
 server.listen(PORT, HOST, () => {
-  console.log(`[claude-responses-adapter] listening on http://${HOST}:${PORT}; upstream=${UPSTREAM_BASE_URL}; model=${DEFAULT_MODEL}`);
+  const proxyInfo = PROXY_URL ? `; proxy=${PROXY_URL}` : "";
+  console.log(`[claude-responses-adapter] listening on http://${HOST}:${PORT}; upstream=${UPSTREAM_BASE_URL}; model=${DEFAULT_MODEL}${proxyInfo}`);
 });
 
 function shutdown(signal) {

@@ -8,6 +8,7 @@ PORT="${CLAUDE_RESPONSES_ADAPTER_PORT:-47827}"
 API_KEY="${MEMOFUN_API_KEY:-}"
 SERVICE_MODE="${RESPONSES_SERVICE_MODE:-auto}"
 ACTIVE_SERVICE_MODE=""
+PROXY_URL="${RESPONSES_PROXY_URL:-}"
 
 usage() {
   cat <<'EOF'
@@ -19,12 +20,13 @@ Options:
   --upstream URL      Upstream base URL (default: https://ca.memofun.net)
   --port PORT         Local adapter port (default: 47827)
   --service-mode MODE Linux service: auto, systemd, or nohup (default: auto)
+  --proxy URL         HTTP/HTTPS proxy for upstream requests (e.g. http://10.0.0.1:8080)
   -h, --help          Show this help
 
 Environment alternatives:
   MEMOFUN_API_KEY, RESPONSES_DEFAULT_MODEL,
   RESPONSES_UPSTREAM_BASE_URL, CLAUDE_RESPONSES_ADAPTER_PORT,
-  RESPONSES_SERVICE_MODE
+  RESPONSES_SERVICE_MODE, RESPONSES_PROXY_URL
 EOF
 }
 
@@ -48,6 +50,10 @@ while (($#)); do
       ;;
     --service-mode)
       SERVICE_MODE="${2:-}"
+      shift 2
+      ;;
+    --proxy)
+      PROXY_URL="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -222,6 +228,7 @@ install_macos_service() {
   MODEL_VALUE="$MODEL" \
   PORT_VALUE="$PORT" \
   LABEL_VALUE="$LABEL" \
+  PROXY_VALUE="$PROXY_URL" \
   "$NODE_BIN" -e '
 const fs = require("node:fs");
 const escapeXml = (value) => String(value)
@@ -252,7 +259,16 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
     <string>${e(process.env.UPSTREAM_VALUE)}</string>
     <key>RESPONSES_DEFAULT_MODEL</key>
     <string>${e(process.env.MODEL_VALUE)}</string>
-  </dict>
+${process.env.PROXY_VALUE ? `
+    <key>http_proxy</key>
+    <string>${e(process.env.PROXY_VALUE)}</string>
+    <key>https_proxy</key>
+    <string>${e(process.env.PROXY_VALUE)}</string>
+    <key>HTTP_PROXY</key>
+    <string>${e(process.env.PROXY_VALUE)}</string>
+    <key>HTTPS_PROXY</key>
+    <string>${e(process.env.PROXY_VALUE)}</string>
+` : ""}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -314,10 +330,14 @@ install_linux_systemd_service() {
   UPSTREAM_VALUE="${UPSTREAM_BASE_URL%/}" \
   MODEL_VALUE="$MODEL" \
   PORT_VALUE="$PORT" \
+  PROXY_VALUE="$PROXY_URL" \
   "$NODE_BIN" -e '
 const fs = require("node:fs");
 const quote = (value) => `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"")}"`;
 const env = (name, value) => `Environment=${quote(`${name}=${value}`)}`;
+const proxyLines = process.env.PROXY_VALUE
+  ? `${env("http_proxy", process.env.PROXY_VALUE)}\n${env("https_proxy", process.env.PROXY_VALUE)}\n${env("HTTP_PROXY", process.env.PROXY_VALUE)}\n${env("HTTPS_PROXY", process.env.PROXY_VALUE)}`
+  : "";
 const unit = `[Unit]
 Description=Claude Code Responses API adapter
 After=network-online.target
@@ -330,6 +350,7 @@ ${env("CLAUDE_RESPONSES_ADAPTER_HOST", "127.0.0.1")}
 ${env("CLAUDE_RESPONSES_ADAPTER_PORT", process.env.PORT_VALUE)}
 ${env("RESPONSES_UPSTREAM_BASE_URL", process.env.UPSTREAM_VALUE)}
 ${env("RESPONSES_DEFAULT_MODEL", process.env.MODEL_VALUE)}
+${proxyLines}
 Restart=always
 RestartSec=2
 UMask=0077
@@ -385,7 +406,13 @@ start_linux_nohup_service() {
     fi
   fi
 
+  PROXY_ENV=()
+  if [[ -n "$PROXY_URL" ]]; then
+    PROXY_ENV=(http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL")
+  fi
+
   nohup env \
+    "${PROXY_ENV[@]+${PROXY_ENV[@]}}" \
     CLAUDE_RESPONSES_ADAPTER_HOST=127.0.0.1 \
     CLAUDE_RESPONSES_ADAPTER_PORT="$PORT" \
     RESPONSES_UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL%/}" \
